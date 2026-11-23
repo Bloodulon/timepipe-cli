@@ -1,0 +1,9 @@
+/target
+*.xlsx
+*.xlsx.bak
+*.timepipe.xlsx
+*.csv
+inspect_xlsx*.py
+client_secret.json
+token.json
+.DS_Store
