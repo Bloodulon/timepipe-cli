@@ -73,6 +73,16 @@ impl Entry {
         }
         s
     }
+    fn as_edit_input(&self) -> String {
+        let mut s = self.as_input();
+        if let Some(dur) = fmt_dur_compact(self.duration()) {
+            if !s.ends_with(' ') {
+                s.push(' ');
+            }
+            s.push_str(&dur);
+        }
+        s
+    }
 }
 
 fn data_path() -> PathBuf {
@@ -80,6 +90,13 @@ fn data_path() -> PathBuf {
     p.push("timepipe");
     let _ = fs::create_dir_all(&p);
     p.push("entries.json");
+    p
+}
+
+/// Exports go to ~/Downloads (or home), never into the current directory.
+fn export_path(name: &str) -> PathBuf {
+    let mut p = dirs::download_dir().or_else(dirs::home_dir).unwrap_or_else(|| PathBuf::from("."));
+    p.push(name);
     p
 }
 
@@ -232,6 +249,20 @@ fn fmt_dur(d: Duration, f: Fmt) -> String {
     }
 }
 
+fn fmt_dur_compact(d: Duration) -> Option<String> {
+    let mins = d.num_seconds().max(0) / 60;
+    if mins == 0 {
+        return None;
+    }
+    let h = mins / 60;
+    let m = mins % 60;
+    Some(match (h, m) {
+        (0, m) => format!("{m}m"),
+        (h, 0) => format!("{h}h"),
+        (h, m) => format!("{h}h{m}m"),
+    })
+}
+
 fn fmt_clock(d: Duration) -> String {
     let s = d.num_seconds().max(0);
     format!("{:02}:{:02}:{:02}", s / 3600, (s / 60) % 60, s % 60)
@@ -250,11 +281,12 @@ enum Mode {
 
 struct App {
     entries: Vec<Entry>,
-    view: usize, // 0 today, 1 week, 2 stats
+    view: usize, // 0 today, 1 week, 2 stats, 3 sheet
     sel: usize,
     mode: Mode,
     input: String,
-    fmt: Fmt,
+    cursor: usize,
+    fmt: [Fmt; 4],
     status: String,
     error: bool,
     quit: bool,
@@ -275,7 +307,8 @@ impl App {
             sel: 0,
             mode: Mode::Normal,
             input: String::new(),
-            fmt: Fmt::Both,
+            cursor: 0,
+            fmt: [Fmt::Both; 4],
             status: String::new(),
             error: false,
             quit: false,
@@ -293,6 +326,16 @@ impl App {
     fn say(&mut self, s: impl Into<String>) {
         self.status = s.into();
         self.error = false;
+    }
+
+    fn cur_fmt(&self) -> Fmt {
+        self.fmt[self.view.min(3)]
+    }
+
+    fn cycle_fmt(&mut self) {
+        let idx = self.view.min(3);
+        self.fmt[idx] = self.fmt[idx].next();
+        self.say(format!("format: {}", self.fmt[idx].name()));
     }
 
     fn visible(&self) -> Vec<usize> {
@@ -447,6 +490,42 @@ impl App {
         }
     }
 
+    fn restore_entries_to_sheet(&mut self) -> usize {
+        let mut seen = std::collections::HashSet::new();
+        let mut indices = Vec::new();
+        for (i, e) in self.entries.iter().enumerate() {
+            let date = e.started_at().date_naive();
+            let proj = e.project.trim().to_lowercase();
+            if proj.is_empty() || proj == "general" {
+                continue;
+            }
+            if seen.insert((date, proj)) {
+                indices.push(i);
+            }
+        }
+        let mut restored = 0;
+        for i in indices {
+            let e = &self.entries[i];
+            let entry_date = e.started_at().date_naive();
+            let should_restore = if let Some(sh) = &self.sheet {
+                if let (Some(row), Some(day_idx)) = (
+                    sh.find_task(&e.project, &e.description, &e.tags),
+                    sh.days.iter().position(|d| d.date == entry_date),
+                ) {
+                    sh.fact(row, day_idx) == 0.0
+                } else {
+                    false
+                }
+            } else {
+                false
+            };
+            if should_restore && self.sync_entry_to_sheet(i, false) {
+                restored += 1;
+            }
+        }
+        restored
+    }
+
     fn start_new(&mut self, p: Parsed) {
         let (stopped, stopped_idx) = self.stop();
         if stopped {
@@ -477,7 +556,7 @@ impl App {
         if has_dur {
             let synced = self.sync_entry_to_sheet(new_idx, true);
             if !synced {
-                self.say(format!("added {} to {}", fmt_dur(dur, self.fmt), p.project));
+                self.say(format!("added {} to {}", fmt_dur(dur, self.cur_fmt()), p.project));
             }
         } else {
             self.say(format!("started {}", p.project));
@@ -485,6 +564,7 @@ impl App {
     }
 
     fn open_input(&mut self, mode: Mode, prefill: String) {
+        self.cursor = prefill.chars().count();
         self.input = prefill;
         self.mode = mode;
         self.status.clear();
@@ -542,6 +622,7 @@ impl App {
             _ => {}
         }
         self.input.clear();
+        self.cursor = 0;
         self.save();
         self.clamp();
     }
@@ -563,8 +644,9 @@ impl App {
                 if e.done { "done" } else { "open" }
             ));
         }
-        match fs::write("timepipe_export.csv", out) {
-            Ok(_) => self.say("exported to ./timepipe_export.csv"),
+        let path = export_path("timepipe_export.csv");
+        match fs::write(&path, out) {
+            Ok(_) => self.say(format!("exported to {}", path.display())),
             Err(e) => {
                 self.status = format!("export failed: {e}");
                 self.error = true;
@@ -574,7 +656,7 @@ impl App {
 
     fn export_xlsx(&mut self) {
         match self.write_xlsx() {
-            Ok(_) => self.say("exported to ./timepipe_export.xlsx"),
+            Ok(_) => self.say(format!("exported to {}", export_path("timepipe_export.xlsx").display())),
             Err(e) => {
                 self.status = format!("xlsx failed: {e}");
                 self.error = true;
@@ -685,7 +767,7 @@ impl App {
         sum.set_column_width(0, 24.0)?;
         sum.set_column_width(1, 10.0)?;
 
-        wb.save("timepipe_export.xlsx")
+        wb.save(export_path("timepipe_export.xlsx"))
     }
 
     fn on_key(&mut self, code: KeyCode, mods: KeyModifiers) {
@@ -708,18 +790,58 @@ impl App {
                 KeyCode::Esc => {
                     self.mode = Mode::Normal;
                     self.input.clear();
+                    self.cursor = 0;
                     self.status.clear();
                 }
                 KeyCode::Enter => self.submit(),
+                KeyCode::Left => {
+                    self.cursor = self.cursor.saturating_sub(1);
+                }
+                KeyCode::Right => {
+                    let len = self.input.chars().count();
+                    if self.cursor < len {
+                        self.cursor += 1;
+                    }
+                }
+                KeyCode::Home => {
+                    self.cursor = 0;
+                }
+                KeyCode::End => {
+                    self.cursor = self.input.chars().count();
+                }
                 KeyCode::Backspace => {
-                    self.input.pop();
+                    if self.cursor > 0 {
+                        let start = byte_index(&self.input, self.cursor - 1);
+                        let end = byte_index(&self.input, self.cursor);
+                        self.input.replace_range(start..end, "");
+                        self.cursor -= 1;
+                    }
+                }
+                KeyCode::Delete => {
+                    let len = self.input.chars().count();
+                    if self.cursor < len {
+                        let start = byte_index(&self.input, self.cursor);
+                        let end = byte_index(&self.input, self.cursor + 1);
+                        self.input.replace_range(start..end, "");
+                    }
                 }
                 KeyCode::Up => {
                     if let Some(e) = self.entries.last() {
                         self.input = e.as_input();
+                        self.cursor = self.input.chars().count();
                     }
                 }
-                KeyCode::Char(c) => self.input.push(c),
+                KeyCode::Char('a') if mods.contains(KeyModifiers::CONTROL) => {
+                    self.cursor = 0;
+                }
+                KeyCode::Char('e') if mods.contains(KeyModifiers::CONTROL) => {
+                    self.cursor = self.input.chars().count();
+                }
+                KeyCode::Char(c) => {
+                    let idx = byte_index(&self.input, self.cursor);
+                    self.input.insert(idx, c);
+                    self.cursor += 1;
+                }
                 _ => {}
             },
         }
@@ -749,8 +871,34 @@ impl App {
         }
     }
 
+    fn sync_sheet_from_drive(&mut self) {
+        self.say("syncing from Google Drive...");
+        let target = sheet::sheet_path();
+        match sync::sync_spreadsheet(sync::DEFAULT_SPREADSHEET_ID, &target) {
+            Ok(msg) => {
+                let (sh, err) = open_sheet();
+                self.sheet = sh;
+                self.sheet_err = err;
+                let restored = self.restore_entries_to_sheet();
+                if restored > 0 {
+                    self.say(format!("✔ {msg} · restored {restored} tracked"));
+                } else {
+                    self.say(format!("✔ {msg}"));
+                }
+            }
+            Err(e) => {
+                self.status = format!("Sync error: {e}");
+                self.error = true;
+            }
+        }
+    }
+
     /// keys of the Sheet tab; returns true if handled
     fn on_key_sheet(&mut self, code: KeyCode) -> bool {
+        if code == KeyCode::Char('U') {
+            self.sync_sheet_from_drive();
+            return true;
+        }
         if self.sheet.is_none() {
             return false;
         }
@@ -815,31 +963,10 @@ impl App {
                     }
                 }
             }
-            KeyCode::Char('U') => {
-                self.say("syncing from Google Drive...");
-                let target = if let Some(sh) = &self.sheet {
-                    // original filename (strip .timepipe.xlsx if needed)
-                    let orig_name = sh.file_name().replace(".timepipe.xlsx", ".xlsx");
-                    PathBuf::from(orig_name)
-                } else {
-                    PathBuf::from("Загрузка — 2026 — Игорь Ярлыков.xlsx")
-                };
-                match sync::sync_spreadsheet(sync::DEFAULT_SPREADSHEET_ID, &target) {
-                    Ok(msg) => {
-                        let (sh, err) = open_sheet();
-                        self.sheet = sh;
-                        self.sheet_err = err;
-                        self.say(format!("✔ {}", msg));
-                    }
-                    Err(e) => {
-                        self.status = format!("Sync error: {e}");
-                        self.error = true;
-                    }
-                }
-            }
             KeyCode::Char('+') | KeyCode::Char('=') => self.sheet_step(0.5),
             KeyCode::Char('-') | KeyCode::Char('_') => self.sheet_step(-0.5),
             KeyCode::Char('d') => self.sheet_apply(None, true, None),
+            KeyCode::Char('f') => self.cycle_fmt(),
             KeyCode::Enter => self.open_input(Mode::SheetEdit, String::new()),
             _ => return false,
         }
@@ -871,7 +998,7 @@ impl App {
             KeyCode::Char('a') => self.open_input(Mode::Manual, String::new()),
             KeyCode::Char('e') => {
                 if let Some(i) = self.selected_index() {
-                    let s = self.entries[i].as_input();
+                    let s = self.entries[i].as_edit_input();
                     self.open_input(Mode::Edit(i), s);
                 }
             }
@@ -965,10 +1092,7 @@ impl App {
                     self.save();
                 }
             }
-            KeyCode::Char('f') => {
-                self.fmt = self.fmt.next();
-                self.say(format!("format: {}", self.fmt.name()));
-            }
+            KeyCode::Char('f') => self.cycle_fmt(),
             KeyCode::Char('x') => self.export_csv(),
             KeyCode::Char('X') => self.export_xlsx(),
             _ => {}
@@ -1059,7 +1183,11 @@ fn ui(f: &mut Frame, app: &App) {
 
     draw_header(f, app, rows[0]);
 
-    let top = Layout::horizontal([Constraint::Min(30), Constraint::Length(40)]).split(rows[1]);
+    let top = if app.status.is_empty() {
+        Layout::horizontal([Constraint::Min(0), Constraint::Length(0)]).split(rows[1])
+    } else {
+        Layout::horizontal([Constraint::Length(36), Constraint::Min(10)]).split(rows[1])
+    };
     f.render_widget(
         Tabs::new(vec![" 1 Today ", " 2 Week ", " 3 Stats ", " 4 Sheet "])
             .select(app.view)
@@ -1082,11 +1210,24 @@ fn ui(f: &mut Frame, app: &App) {
     } else if app.view == 2 {
         draw_stats(f, app, rows[2]);
     } else {
-        let body = Layout::horizontal([Constraint::Min(50), Constraint::Length(34)]).split(rows[2]);
-        let halves = Layout::horizontal([Constraint::Percentage(50), Constraint::Percentage(50)]).split(body[0]);
-        draw_table(f, app, halves[0], false);
-        draw_table(f, app, halves[1], true);
-        draw_details(f, app, body[1]);
+        let w = rows[2].width;
+        if w >= 132 {
+            let body = Layout::horizontal([Constraint::Min(50), Constraint::Length(30)]).split(rows[2]);
+            let halves = Layout::horizontal([Constraint::Percentage(50), Constraint::Percentage(50)]).split(body[0]);
+            draw_table(f, app, halves[0], false);
+            draw_table(f, app, halves[1], true);
+            draw_details(f, app, body[1]);
+        } else if w >= 96 {
+            let body = Layout::horizontal([Constraint::Min(50), Constraint::Length(30)]).split(rows[2]);
+            let halves = Layout::vertical([Constraint::Percentage(50), Constraint::Percentage(50)]).split(body[0]);
+            draw_table(f, app, halves[0], false);
+            draw_table(f, app, halves[1], true);
+            draw_details(f, app, body[1]);
+        } else {
+            let halves = Layout::vertical([Constraint::Percentage(50), Constraint::Percentage(50)]).split(rows[2]);
+            draw_table(f, app, halves[0], false);
+            draw_table(f, app, halves[1], true);
+        }
     }
 
     draw_footer(f, app, rows[3]);
@@ -1154,7 +1295,7 @@ fn draw_header(f: &mut Frame, app: &App, area: Rect) {
             .gauge_style(Style::default().fg(color).bg(SURFACE))
             .use_unicode(true)
             .ratio(ratio)
-            .label(format!("{} · {:.0}%", fmt_dur(total, app.fmt), ratio * 100.0)),
+            .label(format!("{} · {:.0}%", fmt_dur(total, app.cur_fmt()), ratio * 100.0)),
         cols[1],
     );
 }
@@ -1164,6 +1305,16 @@ fn draw_table(f: &mut Frame, app: &App, area: Rect, done: bool) {
     let offset = if done { all.iter().filter(|&&i| !app.entries[i].done).count() } else { 0 };
     let vis: Vec<usize> = all.iter().copied().filter(|&i| app.entries[i].done == done).collect();
     let week = app.view == 1;
+    let start_w: u16 = if week { 9 } else { 5 };
+    let time_w: u16 = match app.cur_fmt() {
+        Fmt::Both => 14,
+        Fmt::HoursMin => 7,
+        Fmt::Decimal => 6,
+    };
+    let show_tags = area.width >= 54;
+    let proj_w: u16 = if area.width < 54 { 10 } else { 12 };
+    let tags_w: u16 = if area.width >= 66 { 10 } else { 8 };
+
     let rows: Vec<Row> = vis
         .iter()
         .map(|&i| {
@@ -1177,19 +1328,22 @@ fn draw_table(f: &mut Frame, app: &App, area: Rect, done: bool) {
                 "◔ "
             };
             let dur_style = if e.running() { Style::default().fg(GREEN) } else { Style::default().fg(Color::White) };
-            Row::new(vec![
+            let mut cells = vec![
                 Cell::from(Span::styled(when, Style::default().fg(DIM))),
                 Cell::from(Line::from(vec![
                     Span::styled(marker, Style::default().fg(GREEN)),
                     Span::styled(e.project.clone(), Style::default().fg(project_color(&e.project))),
                 ])),
                 Cell::from(e.description.clone()),
-                Cell::from(Span::styled(
+            ];
+            if show_tags {
+                cells.push(Cell::from(Span::styled(
                     e.tags.iter().map(|t| format!("#{t}")).collect::<Vec<_>>().join(" "),
                     Style::default().fg(YELLOW),
-                )),
-                Cell::from(Span::styled(fmt_dur(e.duration(), app.fmt), dur_style)),
-            ])
+                )));
+            }
+            cells.push(Cell::from(Span::styled(fmt_dur(e.duration(), app.cur_fmt()), dur_style)));
+            Row::new(cells)
         })
         .collect();
     let total = vis.iter().fold(Duration::zero(), |a, &i| a + app.entries[i].duration());
@@ -1198,33 +1352,35 @@ fn draw_table(f: &mut Frame, app: &App, area: Rect, done: bool) {
         if done { "✔ DONE" } else { "◔ OPEN" },
         if week { "7 days" } else { "today" },
         vis.len(),
-        fmt_dur(total, app.fmt)
+        fmt_dur(total, app.cur_fmt())
     );
-    let table = Table::new(
-        rows,
-        [
-            Constraint::Length(6),
-            Constraint::Length(12),
-            Constraint::Min(8),
-            Constraint::Length(8),
-            Constraint::Length(14),
-        ],
-    )
-    .header(
-        Row::new(vec!["START", "PROJECT", "DESCRIPTION", "TAGS", "TIME"])
-            .style(Style::default().fg(DIM).add_modifier(Modifier::BOLD)),
-    )
-    .row_highlight_style(Style::default().bg(SURFACE).add_modifier(Modifier::BOLD))
-    .highlight_symbol("▌")
-    .block(panel(title));
+    let mut widths = vec![
+        Constraint::Length(start_w),
+        Constraint::Length(proj_w),
+        Constraint::Min(8),
+    ];
+    let mut header_cols = vec!["START", "PROJECT", "DESCRIPTION"];
+    if show_tags {
+        widths.push(Constraint::Length(tags_w));
+        header_cols.push("TAGS");
+    }
+    widths.push(Constraint::Length(time_w));
+    header_cols.push("TIME");
+
+    let table = Table::new(rows, widths)
+        .header(Row::new(header_cols).style(Style::default().fg(DIM).add_modifier(Modifier::BOLD)))
+        .row_highlight_style(Style::default().bg(SURFACE).add_modifier(Modifier::BOLD))
+        .highlight_symbol("▌")
+        .block(panel(title));
     let selected = if app.sel >= offset && app.sel < offset + vis.len() { Some(app.sel - offset) } else { None };
     let mut st = TableState::default().with_selected(selected);
     f.render_stateful_widget(table, area, &mut st);
 
-    if vis.is_empty() {
-        let r = Rect::new(area.x + 2, area.y + 3, area.width.saturating_sub(4), 1);
+    if vis.is_empty() && area.height >= 4 {
+        let r = Rect::new(area.x + 2, area.y + 3, area.width.saturating_sub(4), area.height.saturating_sub(4));
         f.render_widget(
             Paragraph::new(if done { "no finished tasks · press c to mark done" } else { "nothing open · s start · a add" })
+                .wrap(ratatui::widgets::Wrap { trim: true })
                 .style(Style::default().fg(DIM)),
             r,
         );
@@ -1285,7 +1441,10 @@ fn draw_details(f: &mut Frame, app: &App, area: Rect) {
         label("7 days"),
         Span::styled(spark(&vals), Style::default().fg(ACCENT)),
     ]));
-    f.render_widget(Paragraph::new(lines).block(panel(" details ")), area);
+    f.render_widget(
+        Paragraph::new(lines).wrap(ratatui::widgets::Wrap { trim: true }).block(panel(" details ")),
+        area,
+    );
 }
 
 fn draw_stats(f: &mut Frame, app: &App, area: Rect) {
@@ -1359,7 +1518,7 @@ fn draw_stats(f: &mut Frame, app: &App, area: Rect) {
             Line::from(vec![
                 Span::styled(format!("{:<12} ", p.chars().take(12).collect::<String>()), Style::default().fg(c)),
                 Span::styled(bar(*s, pmax, 18), Style::default().fg(c)),
-                Span::styled(format!(" {}", fmt_dur(Duration::seconds(*s), app.fmt)), Style::default().fg(DIM)),
+                Span::styled(format!(" {}", fmt_dur(Duration::seconds(*s), app.cur_fmt())), Style::default().fg(DIM)),
             ])
         })
         .collect();
@@ -1373,7 +1532,7 @@ fn draw_stats(f: &mut Frame, app: &App, area: Rect) {
             Line::from(vec![
                 Span::styled(format!("{} ", d.format("%a %d.%m")), Style::default().fg(if *d == today { YELLOW } else { DIM })),
                 Span::styled(bar(*s, dmax, 18), Style::default().fg(c)),
-                Span::styled(format!(" {}", fmt_dur(Duration::seconds(*s), app.fmt)), Style::default().fg(DIM)),
+                Span::styled(format!(" {}", fmt_dur(Duration::seconds(*s), app.cur_fmt())), Style::default().fg(DIM)),
             ])
         })
         .collect();
@@ -1390,6 +1549,7 @@ fn draw_footer(f: &mut Frame, app: &App, area: Rect) {
             ("y", "yank/copy"),
             ("U", "sync drive"),
             ("d", "clear"),
+            ("f", "format"),
             ("[ ]", "month"),
             ("tab", "view"),
             ("q", "quit"),
@@ -1418,6 +1578,21 @@ fn draw_footer(f: &mut Frame, app: &App, area: Rect) {
     f.render_widget(Paragraph::new(Line::from(spans)), area);
 }
 
+fn byte_index(s: &str, char_idx: usize) -> usize {
+    s.char_indices().nth(char_idx).map(|(i, _)| i).unwrap_or(s.len())
+}
+
+fn input_line<'a>(input: &str, cursor: usize) -> Line<'a> {
+    let idx = byte_index(input, cursor);
+    let (before, after) = input.split_at(idx);
+    Line::from(vec![
+        Span::styled("❯ ", Style::default().fg(ACCENT).add_modifier(Modifier::BOLD)),
+        Span::raw(before.to_string()),
+        Span::styled("▏", Style::default().fg(ACCENT)),
+        Span::raw(after.to_string()),
+    ])
+}
+
 fn draw_input(f: &mut Frame, app: &App) {
     if matches!(app.mode, Mode::SheetEdit) {
         draw_sheet_input(f, app);
@@ -1432,11 +1607,7 @@ fn draw_input(f: &mut Frame, app: &App) {
     f.render_widget(Clear, r);
     let p = parse_input(&app.input);
     let mut lines = vec![
-        Line::from(vec![
-            Span::styled("❯ ", Style::default().fg(ACCENT).add_modifier(Modifier::BOLD)),
-            Span::raw(app.input.clone()),
-            Span::styled("▏", Style::default().fg(ACCENT)),
-        ]),
+        input_line(&app.input, app.cursor),
         Line::from(""),
         Line::from(vec![
             Span::styled("project  ", Style::default().fg(DIM)),
@@ -1453,7 +1624,7 @@ fn draw_input(f: &mut Frame, app: &App) {
         Line::from(vec![
             Span::styled("time     ", Style::default().fg(DIM)),
             Span::styled(
-                p.dur.map(|d| fmt_dur(d, app.fmt)).unwrap_or_else(|| "-".into()),
+                p.dur.map(|d| fmt_dur(d, app.cur_fmt())).unwrap_or_else(|| "-".into()),
                 Style::default().fg(GREEN),
             ),
         ]),
@@ -1476,27 +1647,34 @@ fn draw_input(f: &mut Frame, app: &App) {
 
 // ───────────────────────── sheet tab ─────────────────────────
 
+/// One-time import: an `.xlsx` lying in the current directory is copied into the data dir.
+fn find_local_xlsx() -> Option<PathBuf> {
+    let mut found: Vec<PathBuf> = fs::read_dir(".")
+        .ok()?
+        .filter_map(|e| e.ok().map(|e| e.path()))
+        .filter(|p| {
+            let n = p.file_name().map(|s| s.to_string_lossy().to_string()).unwrap_or_default();
+            n.ends_with(".xlsx") && !n.starts_with("timepipe_export") && !n.starts_with("~$")
+        })
+        .collect();
+    // prefer a former working copy
+    found.sort_by_key(|p| !p.to_string_lossy().ends_with(".timepipe.xlsx"));
+    found.into_iter().next()
+}
+
 fn open_sheet() -> (Option<sheet::Sheet>, String) {
-    let arg = std::env::args().nth(1).map(PathBuf::from);
-    let path = arg.or_else(|| {
-        let mut found: Vec<PathBuf> = fs::read_dir(".")
-            .ok()?
-            .filter_map(|e| e.ok().map(|e| e.path()))
-            .filter(|p| {
-                let n = p.file_name().map(|s| s.to_string_lossy().to_string()).unwrap_or_default();
-                n.ends_with(".xlsx") && !n.starts_with("timepipe_export") && !n.starts_with("~$")
-            })
-            .collect();
-        // prefer the working copy if it exists
-        found.sort_by_key(|p| !p.to_string_lossy().ends_with(".timepipe.xlsx"));
-        found.into_iter().next()
-    });
-    match path {
-        None => (None, "no .xlsx found here — run: timepipe path/to/file.xlsx".into()),
-        Some(p) => match sheet::Sheet::open(&p) {
-            Ok(s) => (Some(s), String::new()),
-            Err(e) => (None, format!("{}: {}", p.display(), e)),
-        },
+    let path = sheet::sheet_path();
+    if !path.exists() {
+        if let Some(src) = find_local_xlsx() {
+            let _ = fs::copy(src, &path);
+        }
+    }
+    if !path.exists() {
+        return (None, "no sheet yet — open the Sheet tab (4) and press U to sync from Google Drive".into());
+    }
+    match sheet::Sheet::open(&path) {
+        Ok(s) => (Some(s), String::new()),
+        Err(e) => (None, format!("{}: {}", path.display(), e)),
     }
 }
 
@@ -1549,6 +1727,19 @@ fn h1(v: f64) -> String {
     }
 }
 
+/// Hours from the sheet in the current display format (`f` toggles it).
+fn fmt_h(v: f64, f: Fmt) -> String {
+    if v <= 0.0 {
+        return "·".into();
+    }
+    let hm = fmt_dur_compact(Duration::seconds((v * 3600.0).round() as i64)).unwrap_or_else(|| "0m".into());
+    match f {
+        Fmt::Decimal => h1(v),
+        Fmt::HoursMin => hm,
+        Fmt::Both => format!("{} ({})", h1(v), hm),
+    }
+}
+
 fn draw_sheet(f: &mut Frame, app: &App, area: Rect) {
     let Some(sh) = &app.sheet else {
         f.render_widget(
@@ -1561,7 +1752,12 @@ fn draw_sheet(f: &mut Frame, app: &App, area: Rect) {
         );
         return;
     };
-    let cols = Layout::horizontal([Constraint::Length(28), Constraint::Min(40), Constraint::Length(38)]).split(area);
+    let w: u16 = match app.cur_fmt() {
+        Fmt::Both => 12,
+        Fmt::HoursMin => 7,
+        Fmt::Decimal => 5,
+    };
+    let cols = Layout::horizontal([Constraint::Length(2 * w + 19), Constraint::Min(40), Constraint::Length(38)]).split(area);
     let today = Local::now().date_naive();
 
     // days
@@ -1582,13 +1778,13 @@ fn draw_sheet(f: &mut Frame, app: &App, area: Rect) {
             let fact = sh.day_fact(i);
             Row::new(vec![
                 Cell::from(format!("{} {}", wd, d.date.format("%d.%m"))),
-                Cell::from(h1(sh.day_plan(i))),
-                Cell::from(Span::styled(h1(fact), Style::default().fg(if fact > 0.0 { GREEN } else { DIM }))),
+                Cell::from(fmt_h(sh.day_plan(i), app.cur_fmt())),
+                Cell::from(Span::styled(fmt_h(fact, app.cur_fmt()), Style::default().fg(if fact > 0.0 { GREEN } else { DIM }))),
             ])
             .style(base)
         })
         .collect();
-    let days_table = Table::new(day_rows, [Constraint::Length(12), Constraint::Length(6), Constraint::Length(6)])
+    let days_table = Table::new(day_rows, [Constraint::Length(12), Constraint::Length(w + 1), Constraint::Length(w + 1)])
         .header(Row::new(vec!["DAY", "PLAN", "FACT"]).style(Style::default().fg(DIM).add_modifier(Modifier::BOLD)))
         .row_highlight_style(Style::default().bg(SURFACE).add_modifier(Modifier::BOLD))
         .highlight_symbol("▌")
@@ -1615,9 +1811,9 @@ fn draw_sheet(f: &mut Frame, app: &App, area: Rect) {
                 Cell::from(Span::styled(proj.clone(), Style::default().fg(project_color(&proj)))),
                 Cell::from(sh.text(r, 4).to_string()),
                 Cell::from(Span::styled(sh.text(r, 5).to_string(), Style::default().fg(DIM))),
-                Cell::from(Span::styled(h1(plan), Style::default().fg(DIM))),
+                Cell::from(Span::styled(fmt_h(plan, app.cur_fmt()), Style::default().fg(DIM))),
                 Cell::from(Span::styled(
-                    h1(fact),
+                    fmt_h(fact, app.cur_fmt()),
                     Style::default().fg(if fact > 0.0 { GREEN } else { DIM }).add_modifier(Modifier::BOLD),
                 )),
             ])
@@ -1636,8 +1832,8 @@ fn draw_sheet(f: &mut Frame, app: &App, area: Rect) {
             Constraint::Length(16),
             Constraint::Min(14),
             Constraint::Length(6),
-            Constraint::Length(5),
-            Constraint::Length(5),
+            Constraint::Length(w),
+            Constraint::Length(w),
         ],
     )
     .header(Row::new(vec!["", "PROJECT", "TASK", "TYPE", "PLAN", "FACT"]).style(Style::default().fg(DIM).add_modifier(Modifier::BOLD)))
@@ -1661,7 +1857,7 @@ fn draw_sheet(f: &mut Frame, app: &App, area: Rect) {
         lines.push(Line::from(vec![label("type"), Span::raw(sh.text(r, 5).to_string())]));
         lines.push(Line::from(vec![
             label("total"),
-            Span::raw(format!("plan {} / fact {}", h1(sh.num(r, 7)), h1(sh.num(r, 8)))),
+            Span::raw(format!("plan {} / fact {}", fmt_h(sh.num(r, 7), app.cur_fmt()), fmt_h(sh.num(r, 8), app.cur_fmt()))),
         ]));
         lines.push(Line::from(""));
         for (name, col) in [("fact", fcol), ("plan", pcol)] {
@@ -1678,10 +1874,9 @@ fn draw_sheet(f: &mut Frame, app: &App, area: Rect) {
     }
     lines.push(Line::from(""));
     lines.push(Line::from(Span::styled(
-        format!("file: {}", sh.file_name()),
+        format!("file: {}", sh.path.display()),
         Style::default().fg(DIM),
     )));
-    lines.push(Line::from(Span::styled("original is never modified", Style::default().fg(DIM))));
     f.render_widget(
         Paragraph::new(lines).wrap(ratatui::widgets::Wrap { trim: true }).block(panel(" details ")),
         cols[2],
@@ -1708,11 +1903,7 @@ fn draw_sheet_input(f: &mut Frame, app: &App) {
         .unwrap_or_default();
     let lines = vec![
         Line::from(Span::styled(target, Style::default().fg(DIM))),
-        Line::from(vec![
-            Span::styled("❯ ", Style::default().fg(ACCENT).add_modifier(Modifier::BOLD)),
-            Span::raw(app.input.clone()),
-            Span::styled("▏", Style::default().fg(ACCENT)),
-        ]),
+        input_line(&app.input, app.cursor),
         Line::from(""),
         Line::from(vec![
             Span::styled("fact     ", Style::default().fg(DIM)),
@@ -1801,26 +1992,19 @@ fn clean_comment_text(raw: &str) -> String {
     lines.join(" ")
 }
 
+fn fmt_hours(v: f64) -> String {
+    format!("{:.2}", v).trim_end_matches('0').trim_end_matches('.').to_string()
+}
+
 /// What lands in the clipboard for a sheet entry.
-/// If user wants only the hours (or hours + note if note is present).
+/// Copies specifically the fact hours (e.g. "1.72").
 fn clip_text(hours: Option<f64>, comment: &str) -> String {
-    let clean = clean_comment_text(comment);
-    let hours_val = hours.map(|h| h1(h));
-
-    if clean.is_empty() {
-        return hours_val.unwrap_or_default();
-    }
-
-    // If comment is just repeating the hours, output just the hours number
-    if let Some(h) = &hours_val {
-        let clean_trim = clean.trim().trim_end_matches('ч').trim();
-        if clean_trim == h {
-            return h.clone();
+    if let Some(h) = hours {
+        if h > 0.0 {
+            return fmt_hours(h);
         }
-        format!("{} {}", h, clean)
-    } else {
-        clean
     }
+    clean_comment_text(comment)
 }
 
 // ───────────────────────── main ─────────────────────────
@@ -1832,72 +2016,10 @@ fn spinner_frame() -> &'static str {
     SPINNER[((ms / 80) as usize) % SPINNER.len()]
 }
 
-/// Startup loader animation. Any key skips it.
-fn splash(terminal: &mut ratatui::DefaultTerminal, entries: usize) -> io::Result<()> {
-    const FRAMES: usize = 36;
-    const LOGO: [&str; 5] = [
-        "▀█▀ █ █▄ ▄█ █▀▀ █▀█ █ █▀█ █▀▀",
-        " █  █ █ ▀ █ █▀▀ █▀▀ █ █▀▀ █▀▀",
-        " ▀  ▀ ▀   ▀ ▀▀▀ ▀   ▀ ▀   ▀▀▀",
-        "",
-        "track time · stay in flow",
-    ];
-    for frame in 0..=FRAMES {
-        let ratio = frame as f64 / FRAMES as f64;
-        let msg = if ratio < 0.35 {
-            "loading entries…".to_string()
-        } else if ratio < 0.7 {
-            format!("{} entries found", entries)
-        } else if ratio < 1.0 {
-            "syncing clock…".to_string()
-        } else {
-            "ready".to_string()
-        };
-        terminal.draw(|f| {
-            let area = centered(f.area(), 40, 11);
-            let mut lines: Vec<Line> = Vec::new();
-            // logo reveals line by line with a gradient
-            let visible = ((ratio * 1.6) * LOGO.len() as f64).ceil() as usize;
-            for (i, l) in LOGO.iter().enumerate() {
-                let c = if i == 4 { DIM } else { PALETTE[(i + frame / 4) % PALETTE.len()] };
-                if i < visible {
-                    lines.push(Line::from(Span::styled(*l, Style::default().fg(c).add_modifier(Modifier::BOLD))));
-                } else {
-                    lines.push(Line::from(""));
-                }
-            }
-            lines.push(Line::from(""));
-            let filled = (ratio * 30.0).round() as usize;
-            lines.push(Line::from(vec![
-                Span::styled("█".repeat(filled), Style::default().fg(ACCENT)),
-                Span::styled("░".repeat(30 - filled), Style::default().fg(SURFACE)),
-                Span::styled(format!(" {:>3.0}%", ratio * 100.0), Style::default().fg(DIM)),
-            ]));
-            lines.push(Line::from(vec![
-                Span::styled(
-                    if ratio < 1.0 { spinner_frame() } else { "✔" },
-                    Style::default().fg(if ratio < 1.0 { ACCENT } else { GREEN }),
-                ),
-                Span::styled(format!(" {}", msg), Style::default().fg(DIM)),
-            ]));
-            f.render_widget(Paragraph::new(lines).alignment(Alignment::Center), area);
-        })?;
-        if event::poll(StdDuration::from_millis(45))? {
-            if let Event::Key(k) = event::read()? {
-                if k.kind == KeyEventKind::Press {
-                    break;
-                }
-            }
-        }
-    }
-    Ok(())
-}
-
 fn main() -> io::Result<()> {
     if std::env::args().nth(1).as_deref() == Some("sync") {
         println!("Syncing spreadsheet from Google Drive...");
-        let target = PathBuf::from("Загрузка — 2026 — Игорь Ярлыков.xlsx");
-        match sync::sync_spreadsheet(sync::DEFAULT_SPREADSHEET_ID, &target) {
+        match sync::sync_spreadsheet(sync::DEFAULT_SPREADSHEET_ID, &sheet::sheet_path()) {
             Ok(msg) => {
                 println!("✔ {}", msg);
                 return Ok(());
@@ -1911,7 +2033,6 @@ fn main() -> io::Result<()> {
 
     let mut terminal = ratatui::init();
     let mut app = App::load();
-    let _ = splash(&mut terminal, app.entries.len());
     let res = (|| -> io::Result<()> {
         while !app.quit {
             terminal.draw(|f| ui(f, &app))?;
@@ -2054,7 +2175,8 @@ mod tests {
             sel: 0,
             mode: Mode::Normal,
             input: String::new(),
-            fmt: Fmt::Both,
+            cursor: 0,
+            fmt: [Fmt::Both; 4],
             status: String::new(),
             error: false,
             quit: false,
@@ -2070,6 +2192,66 @@ mod tests {
         assert_eq!(e.accumulated_sec, 3600);
         assert_eq!(e.duration().num_minutes(), 60);
         assert!(e.end.is_some()); // recorded and stopped
+    }
+
+    #[test]
+    fn test_clip_text_only_fact_hours() {
+        assert_eq!(clip_text(Some(1.72), "#баги"), "1.72");
+        assert_eq!(clip_text(Some(1.0), "#баги"), "1");
+        assert_eq!(clip_text(Some(0.5), "комментарий"), "0.5");
+        assert_eq!(clip_text(Some(0.42), ""), "0.42");
+        assert_eq!(clip_text(None, "только заметка"), "только заметка");
+    }
+
+    #[test]
+    fn test_entry_as_edit_input_includes_duration() {
+        let now = Local::now();
+        let mk = |secs: i64, desc: &str, tags: Vec<&str>| Entry {
+            project: "crm".into(),
+            description: desc.into(),
+            tags: tags.into_iter().map(String::from).collect(),
+            start: now,
+            end: Some(now),
+            done: false,
+            accumulated_sec: secs,
+            first_start: Some(now),
+        };
+
+        assert_eq!(mk(80 * 60, "fix bug", vec!["api"]).as_edit_input(), "crm: fix bug #api 1h20m");
+        assert_eq!(mk(60 * 60, "review", vec![]).as_edit_input(), "crm: review 1h");
+        assert_eq!(mk(25 * 60, "", vec![]).as_edit_input(), "crm: 25m");
+        assert_eq!(mk(0, "just started", vec![]).as_edit_input(), "crm: just started");
+        assert_eq!(mk(80 * 60, "fix bug", vec!["api"]).as_input(), "crm: fix bug #api");
+    }
+
+    #[test]
+    fn test_per_tab_format() {
+        let mut app = App {
+            entries: Vec::new(),
+            view: 0,
+            sel: 0,
+            mode: Mode::Normal,
+            input: String::new(),
+            cursor: 0,
+            fmt: [Fmt::Both; 4],
+            status: String::new(),
+            error: false,
+            quit: false,
+            sheet: None,
+            sheet_err: String::new(),
+        };
+
+        app.cycle_fmt();
+        assert!(matches!(app.cur_fmt(), Fmt::HoursMin));
+
+        app.view = 3;
+        assert!(matches!(app.cur_fmt(), Fmt::Both));
+        app.cycle_fmt();
+        app.cycle_fmt();
+        assert!(matches!(app.cur_fmt(), Fmt::Decimal));
+
+        app.view = 0;
+        assert!(matches!(app.cur_fmt(), Fmt::HoursMin));
     }
 }
 

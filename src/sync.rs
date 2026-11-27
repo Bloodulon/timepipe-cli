@@ -197,7 +197,7 @@ pub fn get_valid_token() -> Result<String, String> {
     Ok(new_token.access_token)
 }
 
-/// Downloads the Google Sheets document as XLSX and replaces `target_file` (with .bak backup).
+/// Downloads the Google Sheets document as XLSX and replaces `target_file`.
 pub fn sync_spreadsheet(file_id: &str, target_file: &Path) -> Result<String, String> {
     let token = get_valid_token()?;
     let url = format!(
@@ -234,14 +234,10 @@ pub fn sync_spreadsheet(file_id: &str, target_file: &Path) -> Result<String, Str
         return Err(format!("Not an XLSX file (response preview: {})", preview.trim()));
     }
 
-    // Backup existing file if present
-    if target_file.exists() {
-        let bak = target_file.with_extension("xlsx.bak");
-        let _ = fs::copy(target_file, bak);
-    }
-
-    // Write to target
-    fs::write(target_file, &bytes).map_err(|e| format!("Failed to write XLSX to {}: {e}", target_file.display()))?;
+    // Write atomically so a failed write never corrupts the existing sheet
+    let tmp = target_file.with_extension("xlsx.tmp");
+    fs::write(&tmp, &bytes).map_err(|e| format!("Failed to write XLSX to {}: {e}", tmp.display()))?;
+    fs::rename(&tmp, target_file).map_err(|e| format!("Failed to replace {}: {e}", target_file.display()))?;
 
     Ok(format!("Synced successfully ({:.1} MB)", bytes.len() as f64 / (1024.0 * 1024.0)))
 }

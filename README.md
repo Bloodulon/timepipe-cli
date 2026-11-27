@@ -3,11 +3,12 @@
 Terminal time tracker built with Rust and ratatui.
 
 ```
-rustup default stable
-cargo run --release
+./install.sh
 ```
 
-Data: `~/.local/share/timepipe/entries.json`
+Builds a release binary, installs it to `~/.local/bin/timepipe` and adds a **timepipe** launcher to your app menu (opens in your default terminal). Or just `cargo run --release`.
+
+Data lives in `~/.local/share/timepipe/` (`entries.json`, `sheet.xlsx`); nothing is written into the project folder. Exports (`x` / `X`) go to `~/Downloads`.
 
 ## Quick input
 
@@ -29,13 +30,13 @@ Data: `~/.local/share/timepipe/entries.json`
 | 1 2 3, Tab | Today / Week / Stats |
 | j k g G | move |
 | f | time format: `30m (0.50h)` → `1h 30m` → `0.50h` |
-| x | export `./timepipe_export.csv` |
-| X | export `./timepipe_export.xlsx` |
+| x | export `~/Downloads/timepipe_export.csv` |
+| X | export `~/Downloads/timepipe_export.xlsx` |
 | q | quit |
 
 ## Sheet Tab (Workload file `.xlsx`)
 
-Press `4` to switch to **Sheet** mode. It automatically detects and works with your `Загрузка — 2026 — Игорь Ярлыков.xlsx` (creating/updating a safe working copy `.timepipe.xlsx`).
+Press `4` to switch to **Sheet** mode. The workbook is stored as `~/.local/share/timepipe/sheet.xlsx`; on first run an `.xlsx` from the current directory is imported once, otherwise press `U` to sync it from Google Drive.
 
 | key | action |
 |---|---|
@@ -43,6 +44,8 @@ Press `4` to switch to **Sheet** mode. It automatically detects and works with y
 | `↑` / `↓` (or `k` / `j`) | Select task |
 | `[` / `]` | Previous / next month |
 | `+` / `-` | Quick adjust ±0.5h Fact |
+| `f` | Time format (same as on Today): `1.5 (1h30m)` → `1h30m` → `1.5` |
+| `U` | Sync workbook from Google Drive |
 | `Enter` | Input e.g. `0.5 fix login bug` → writes to local copy **AND copies to clipboard** |
 | `y` | Copy (yank) current cell's comment + hours to clipboard |
 | `d` | Clear Fact for selected task & day |

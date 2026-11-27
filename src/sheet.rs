@@ -227,6 +227,9 @@ fn parse_cells(xml: &str, shared: &[String]) -> HashMap<(u32, u32), String> {
             if let (Some(v), Some(r)) = (val, attr(tag, "r")) {
                 if !v.is_empty() {
                     let (c, rw) = split_ref(&r);
+                    if rw > LAST_TASK_ROW {
+                        break; // cells are row-ordered; nothing we need below
+                    }
                     out.insert((rw, c), v);
                 }
             }
@@ -236,20 +239,18 @@ fn parse_cells(xml: &str, shared: &[String]) -> HashMap<(u32, u32), String> {
     out
 }
 
-impl Sheet {
-    /// `orig` is never modified: we work on `<name>.timepipe.xlsx` next to it.
-    pub fn open(orig: &Path) -> Res<Sheet> {
-        let stem = orig.file_stem().map(|s| s.to_string_lossy().to_string()).unwrap_or_default();
-        let work = orig.with_file_name(format!("{stem}.timepipe.xlsx"));
-        let path = if orig.to_string_lossy().ends_with(".timepipe.xlsx") {
-            orig.to_path_buf()
-        } else {
-            if !work.exists() {
-                fs::copy(orig, &work).map_err(e)?;
-            }
-            work
-        };
+/// The single workbook file the app works on: `<data dir>/timepipe/sheet.xlsx`.
+pub fn sheet_path() -> PathBuf {
+    let mut p = dirs::data_dir().unwrap_or_else(|| PathBuf::from("."));
+    p.push("timepipe");
+    let _ = fs::create_dir_all(&p);
+    p.push("sheet.xlsx");
+    p
+}
 
+impl Sheet {
+    pub fn open(path: &Path) -> Res<Sheet> {
+        let path = path.to_path_buf();
         let wb = read_entry(&path, "xl/workbook.xml")?;
         let rels_xml = read_entry(&path, "xl/_rels/workbook.xml.rels")?;
         let mut rels: HashMap<String, String> = HashMap::new();
@@ -288,10 +289,6 @@ impl Sheet {
         };
         s.load_month()?;
         Ok(s)
-    }
-
-    pub fn file_name(&self) -> String {
-        self.path.file_name().map(|s| s.to_string_lossy().to_string()).unwrap_or_default()
     }
 
     pub fn month_name(&self) -> &str {
