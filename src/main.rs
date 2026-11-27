@@ -1186,11 +1186,12 @@ fn ui(f: &mut Frame, app: &App) {
     let top = if app.status.is_empty() {
         Layout::horizontal([Constraint::Min(0), Constraint::Length(0)]).split(rows[1])
     } else {
-        Layout::horizontal([Constraint::Length(36), Constraint::Min(10)]).split(rows[1])
+        Layout::horizontal([Constraint::Length(35), Constraint::Min(10)]).split(rows[1])
     };
     f.render_widget(
         Tabs::new(vec![" 1 Today ", " 2 Week ", " 3 Stats ", " 4 Sheet "])
             .select(app.view)
+            .padding("", "")
             .style(Style::default().fg(DIM))
             .highlight_style(Style::default().fg(Color::Black).bg(ACCENT).add_modifier(Modifier::BOLD))
             .divider(""),
@@ -1753,11 +1754,22 @@ fn draw_sheet(f: &mut Frame, app: &App, area: Rect) {
         return;
     };
     let w: u16 = match app.cur_fmt() {
-        Fmt::Both => 12,
+        Fmt::Both => 14,
         Fmt::HoursMin => 7,
         Fmt::Decimal => 5,
     };
-    let cols = Layout::horizontal([Constraint::Length(2 * w + 19), Constraint::Min(40), Constraint::Length(38)]).split(area);
+    let days_w = 2 * w + 16;
+    let details_min_total = days_w + 67 + 30;
+    let (days_area, tasks_area, details_area) = if area.width >= details_min_total {
+        let cols = Layout::horizontal([Constraint::Length(days_w), Constraint::Min(67), Constraint::Length(30)]).split(area);
+        (cols[0], cols[1], Some(cols[2]))
+    } else if area.width >= days_w + 52 {
+        let cols = Layout::horizontal([Constraint::Length(days_w), Constraint::Min(52)]).split(area);
+        (cols[0], cols[1], None)
+    } else {
+        let rows = Layout::vertical([Constraint::Percentage(40), Constraint::Percentage(60)]).split(area);
+        (rows[0], rows[1], None)
+    };
     let today = Local::now().date_naive();
 
     // days
@@ -1784,20 +1796,22 @@ fn draw_sheet(f: &mut Frame, app: &App, area: Rect) {
             .style(base)
         })
         .collect();
-    let days_table = Table::new(day_rows, [Constraint::Length(12), Constraint::Length(w + 1), Constraint::Length(w + 1)])
+    let days_table = Table::new(day_rows, [Constraint::Length(10), Constraint::Length(w), Constraint::Length(w)])
         .header(Row::new(vec!["DAY", "PLAN", "FACT"]).style(Style::default().fg(DIM).add_modifier(Modifier::BOLD)))
         .row_highlight_style(Style::default().bg(SURFACE).add_modifier(Modifier::BOLD))
         .highlight_symbol("▌")
         .block(panel(format!(" ‹ {} › ", sh.month_name())));
     let mut dst = TableState::default().with_selected(Some(sh.day));
-    f.render_stateful_widget(days_table, cols[0], &mut dst);
+    f.render_stateful_widget(days_table, days_area, &mut dst);
 
     // tasks for the selected day
     let Some(day) = sh.days.get(sh.day) else {
-        f.render_widget(Paragraph::new("no days in this sheet").block(panel(" tasks ")), cols[1]);
+        f.render_widget(Paragraph::new("no days in this sheet").block(panel(" tasks ")), tasks_area);
         return;
     };
     let (pcol, fcol) = (day.col + 1, day.col + 2);
+    let show_type = tasks_area.width >= 2 * w + 38;
+    let proj_w: u16 = if tasks_area.width >= 2 * w + 50 { 14 } else { 11 };
     let task_rows: Vec<Row> = sh
         .tasks
         .iter()
@@ -1806,17 +1820,20 @@ fn draw_sheet(f: &mut Frame, app: &App, area: Rect) {
             let proj = sh.text(r, 2).to_string();
             let fact = sh.num(r, fcol);
             let plan = sh.num(r, pcol);
-            Row::new(vec![
+            let mut cells = vec![
                 Cell::from(Span::styled(if has_note { "✎" } else { " " }, Style::default().fg(YELLOW))),
                 Cell::from(Span::styled(proj.clone(), Style::default().fg(project_color(&proj)))),
                 Cell::from(sh.text(r, 4).to_string()),
-                Cell::from(Span::styled(sh.text(r, 5).to_string(), Style::default().fg(DIM))),
-                Cell::from(Span::styled(fmt_h(plan, app.cur_fmt()), Style::default().fg(DIM))),
-                Cell::from(Span::styled(
-                    fmt_h(fact, app.cur_fmt()),
-                    Style::default().fg(if fact > 0.0 { GREEN } else { DIM }).add_modifier(Modifier::BOLD),
-                )),
-            ])
+            ];
+            if show_type {
+                cells.push(Cell::from(Span::styled(sh.text(r, 5).to_string(), Style::default().fg(DIM))));
+            }
+            cells.push(Cell::from(Span::styled(fmt_h(plan, app.cur_fmt()), Style::default().fg(DIM))));
+            cells.push(Cell::from(Span::styled(
+                fmt_h(fact, app.cur_fmt()),
+                Style::default().fg(if fact > 0.0 { GREEN } else { DIM }).add_modifier(Modifier::BOLD),
+            )));
+            Row::new(cells)
         })
         .collect();
     let title = format!(
@@ -1825,62 +1842,65 @@ fn draw_sheet(f: &mut Frame, app: &App, area: Rect) {
         h1(sh.day_plan(sh.day)),
         h1(sh.day_fact(sh.day))
     );
-    let tasks_table = Table::new(
-        task_rows,
-        [
-            Constraint::Length(2),
-            Constraint::Length(16),
-            Constraint::Min(14),
-            Constraint::Length(6),
-            Constraint::Length(w),
-            Constraint::Length(w),
-        ],
-    )
-    .header(Row::new(vec!["", "PROJECT", "TASK", "TYPE", "PLAN", "FACT"]).style(Style::default().fg(DIM).add_modifier(Modifier::BOLD)))
-    .row_highlight_style(Style::default().bg(SURFACE).add_modifier(Modifier::BOLD))
-    .highlight_symbol("▌")
-    .block(panel(title));
+    let mut widths = vec![Constraint::Length(1), Constraint::Length(proj_w), Constraint::Min(10)];
+    let mut hdr = vec!["", "PROJECT", "TASK"];
+    if show_type {
+        widths.push(Constraint::Length(4));
+        hdr.push("TYPE");
+    }
+    widths.push(Constraint::Length(w));
+    widths.push(Constraint::Length(w));
+    hdr.push("PLAN");
+    hdr.push("FACT");
+
+    let tasks_table = Table::new(task_rows, widths)
+        .header(Row::new(hdr).style(Style::default().fg(DIM).add_modifier(Modifier::BOLD)))
+        .row_highlight_style(Style::default().bg(SURFACE).add_modifier(Modifier::BOLD))
+        .highlight_symbol("▌")
+        .block(panel(title));
     let mut tst = TableState::default().with_selected(if sh.tasks.is_empty() { None } else { Some(sh.row) });
-    f.render_stateful_widget(tasks_table, cols[1], &mut tst);
+    f.render_stateful_widget(tasks_table, tasks_area, &mut tst);
 
     // details
-    let mut lines: Vec<Line> = Vec::new();
-    let label = |s: &'static str| Span::styled(format!("{:<9}", s), Style::default().fg(DIM));
-    if let Some(&r) = sh.tasks.get(sh.row) {
-        lines.push(Line::from(vec![label("owner"), Span::raw(sh.text(r, 1).to_string())]));
-        let proj = sh.text(r, 2).to_string();
-        lines.push(Line::from(vec![
-            label("project"),
-            Span::styled(proj.clone(), Style::default().fg(project_color(&proj)).add_modifier(Modifier::BOLD)),
-        ]));
-        lines.push(Line::from(vec![label("task"), Span::raw(sh.text(r, 4).to_string())]));
-        lines.push(Line::from(vec![label("type"), Span::raw(sh.text(r, 5).to_string())]));
-        lines.push(Line::from(vec![
-            label("total"),
-            Span::raw(format!("plan {} / fact {}", fmt_h(sh.num(r, 7), app.cur_fmt()), fmt_h(sh.num(r, 8), app.cur_fmt()))),
-        ]));
-        lines.push(Line::from(""));
-        for (name, col) in [("fact", fcol), ("plan", pcol)] {
-            if let Some((threaded, text)) = sh.comment_at(r, col) {
-                lines.push(Line::from(Span::styled(
-                    format!("✎ {} note{}", name, if *threaded { " (thread)" } else { "" }),
-                    Style::default().fg(YELLOW),
-                )));
-                for l in text.lines().filter(|l| !l.starts_with("[Threaded") && !l.starts_with("Comment:")).take(6) {
-                    lines.push(Line::from(Span::styled(format!(" {}", l), Style::default().fg(Color::White))));
+    if let Some(d_area) = details_area {
+        let mut lines: Vec<Line> = Vec::new();
+        let label = |s: &'static str| Span::styled(format!("{:<9}", s), Style::default().fg(DIM));
+        if let Some(&r) = sh.tasks.get(sh.row) {
+            lines.push(Line::from(vec![label("owner"), Span::raw(sh.text(r, 1).to_string())]));
+            let proj = sh.text(r, 2).to_string();
+            lines.push(Line::from(vec![
+                label("project"),
+                Span::styled(proj.clone(), Style::default().fg(project_color(&proj)).add_modifier(Modifier::BOLD)),
+            ]));
+            lines.push(Line::from(vec![label("task"), Span::raw(sh.text(r, 4).to_string())]));
+            lines.push(Line::from(vec![label("type"), Span::raw(sh.text(r, 5).to_string())]));
+            lines.push(Line::from(vec![
+                label("total"),
+                Span::raw(format!("plan {} / fact {}", fmt_h(sh.num(r, 7), app.cur_fmt()), fmt_h(sh.num(r, 8), app.cur_fmt()))),
+            ]));
+            lines.push(Line::from(""));
+            for (name, col) in [("fact", fcol), ("plan", pcol)] {
+                if let Some((threaded, text)) = sh.comment_at(r, col) {
+                    lines.push(Line::from(Span::styled(
+                        format!("✎ {} note{}", name, if *threaded { " (thread)" } else { "" }),
+                        Style::default().fg(YELLOW),
+                    )));
+                    for l in text.lines().filter(|l| !l.starts_with("[Threaded") && !l.starts_with("Comment:")).take(6) {
+                        lines.push(Line::from(Span::styled(format!(" {}", l), Style::default().fg(Color::White))));
+                    }
                 }
             }
         }
+        lines.push(Line::from(""));
+        lines.push(Line::from(Span::styled(
+            format!("file: {}", sh.path.display()),
+            Style::default().fg(DIM),
+        )));
+        f.render_widget(
+            Paragraph::new(lines).wrap(ratatui::widgets::Wrap { trim: true }).block(panel(" details ")),
+            d_area,
+        );
     }
-    lines.push(Line::from(""));
-    lines.push(Line::from(Span::styled(
-        format!("file: {}", sh.path.display()),
-        Style::default().fg(DIM),
-    )));
-    f.render_widget(
-        Paragraph::new(lines).wrap(ratatui::widgets::Wrap { trim: true }).block(panel(" details ")),
-        cols[2],
-    );
 }
 
 fn draw_sheet_input(f: &mut Frame, app: &App) {
